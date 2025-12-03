@@ -1,461 +1,317 @@
-"""
-robo_aspirador_sim.py
-Simulação única em um arquivo:
-- PyBullet world simples (casa com obstáculos)
-- Robô diferencial com 3 sensores ultrassônicos (simulados via rayTest)
-- Occupancy grid 2D
-- Exploração + evasão, registro de trajetória
-- Aprendizado por repetição simples (reusar mapa e priorizar células não limpas)
-- Envio de métricas para Node-RED via HTTP POST (opcional)
-
-Como usar:
-    pip install pybullet numpy requests
-    python robo_aspirador_sim.py --runs 3 --node-red http://localhost:1880/log
-    python robo_aspirador_sim.py --runs 1 --no-node-red
-
-OBS: é protótipo. Ajuste parâmetros para seu caso.
-"""
-
-import argparse
-import math
 import time
-import pickle
-import os
-import json
-from collections import deque, defaultdict
-
+import math
 import numpy as np
 import pybullet as p
 import pybullet_data
+import json
+import paho.mqtt.client as mqtt
 
-try:
-    import requests
-except Exception:
-    requests = None
+# -----------------------
+# Parâmetros da simulação
+# -----------------------
+SIM_TIMESTEP = 1.0 / 100.0
+SIM_REALTIME = True
+SIM_DURATION = 75.0  # segundos
 
-# ---------- Config ----------
-MAP_FILE = "occupancy_map.pkl"
-LOG_DIR = "sim_logs"
-os.makedirs(LOG_DIR, exist_ok=True)
+# Robô / roda
+WHEEL_RADIUS = 0.04  # m
+WHEEL_BASE = 0.20    # m
+ROBOT_HALF_X = 0.15
+ROBOT_HALF_Y = 0.12
+ROBOT_HALF_Z = 0.05
+MAX_WHEEL_TORQUE = 10.0  # N*m
 
-WORLD_SIZE = 8.0  # meters (square world centered at origin)
-MAP_RESOLUTION = 0.1  # meters per cell
-ROBOT_RADIUS = 0.18  # m
-TIME_STEP = 1.0 / 60.0
+# Sensores ultrassom (ângulos relativos ao heading do robô)
+SENSOR_ANGLES = [
+    math.radians(45), math.radians(22.5), 0.0,
+    math.radians(-22.5), math.radians(-45)
+]
+SENSOR_RANGE = 3.0  # m
 
-SENSOR_ANGLES = [-math.radians(45), 0.0, math.radians(45)]  # left, center, right
-SENSOR_RANGE = 2.0  # meters
+# -----------------------
+# PID para rodas
+# -----------------------
+class PID:
+    def __init__(self, kp, ki, kd, imax=1.0):
+        self.kp = kp
+        self.ki = ki
+        self.kd = kd
+        self.imax = imax
+        self.integral = 0.0
+        self.prev = 0.0
 
-# PID for wheel speed (very simple)
-KP = 10.0
-KI = 0.0
-KD = 0.0
+    def reset(self):
+        self.integral = 0.0
+        self.prev = 0.0
 
-# ---------- Utilities ----------
-def clamp(x, a, b):
-    return max(a, min(b, x))
+    def update(self, error, dt):
+        self.integral += error * dt
+        self.integral = max(min(self.integral, self.imax), -self.imax)
+        deriv = (error - self.prev) / dt if dt>0 else 0.0
+        out = self.kp*error + self.ki*self.integral + self.kd*deriv
+        self.prev = error
+        return out
 
-def world_to_map(x, y, origin_offset, resolution):
-    ix = int((x + origin_offset) / resolution)
-    iy = int((y + origin_offset) / resolution)
-    return ix, iy
+def wrap_to_pi(a):
+    return (a + math.pi) % (2*math.pi) - math.pi
 
-def map_to_world(ix, iy, origin_offset, resolution):
-    x = ix * resolution - origin_offset + resolution / 2.0
-    y = iy * resolution - origin_offset + resolution / 2.0
-    return x, y
+# -----------------------
+# Classe do robô
+# -----------------------
+class DifferentialRobot:
+    def __init__(self, physics_client, start_pos=(0,0,ROBOT_HALF_Z), start_yaw=0.0):
+        self.p = physics_client
+        self.wheel_base = WHEEL_BASE
+        self.wheel_radius = WHEEL_RADIUS
+        self.sensor_angles = SENSOR_ANGLES
+        self.sensor_range = SENSOR_RANGE
 
-# ---------- Occupancy Grid ----------
-class OccupancyGrid:
-    def __init__(self, world_size=WORLD_SIZE, resolution=MAP_RESOLUTION):
-        self.resolution = resolution
-        self.world_size = world_size
-        self.origin_offset = world_size / 2.0
-        self.size_cells = int(math.ceil(world_size / resolution))
-        self.grid = np.zeros((self.size_cells, self.size_cells), dtype=np.float32)  # 0 free, >0 occupied probability
-        self.visits = np.zeros_like(self.grid, dtype=np.int32)
-        self.cleaned_time = np.zeros_like(self.grid, dtype=np.float32)  # total time spent on cell
+        self.left_pid = PID(1.8,0.0,0.03,1.0)
+        self.right_pid = PID(1.8,0.0,0.03,1.0)
+        self.target_left = 0.0
+        self.target_right = 0.0
 
-    def mark_occupied(self, x, y, prob=1.0):
-        ix, iy = world_to_map(x, y, self.origin_offset, self.resolution)
-        if 0 <= ix < self.size_cells and 0 <= iy < self.size_cells:
-            self.grid[ix, iy] = clamp(self.grid[ix, iy] + prob, 0.0, 1.0)
+        body_collision = p.createCollisionShape(p.GEOM_BOX, halfExtents=[ROBOT_HALF_X,ROBOT_HALF_Y,ROBOT_HALF_Z])
+        body_visual = p.createVisualShape(p.GEOM_BOX, halfExtents=[ROBOT_HALF_X,ROBOT_HALF_Y,ROBOT_HALF_Z], rgbaColor=[0.2,0.6,0.9,1.0])
+        wheel_col = p.createCollisionShape(p.GEOM_CYLINDER, radius=self.wheel_radius, height=0.04)
+        wheel_vis = p.createVisualShape(p.GEOM_CYLINDER, radius=self.wheel_radius, length=0.04, rgbaColor=[0.05,0.05,0.05,1.0])
 
-    def mark_free(self, x, y):
-        ix, iy = world_to_map(x, y, self.origin_offset, self.resolution)
-        if 0 <= ix < self.size_cells and 0 <= iy < self.size_cells:
-            # decay occupied prob slowly
-            self.grid[ix, iy] = max(0.0, self.grid[ix, iy] - 0.05)
+        link_positions = [[0.0, self.wheel_base/2.0, -ROBOT_HALF_Z],
+                          [0.0, -self.wheel_base/2.0, -ROBOT_HALF_Z]]
+        link_orientations = [p.getQuaternionFromEuler([math.pi/2,0,0]), p.getQuaternionFromEuler([math.pi/2,0,0])]
 
-    def increment_visit(self, x, y, dt=0.0):
-        ix, iy = world_to_map(x, y, self.origin_offset, self.resolution)
-        if 0 <= ix < self.size_cells and 0 <= iy < self.size_cells:
-            self.visits[ix, iy] += 1
-            if dt > 0:
-                self.cleaned_time[ix, iy] += dt
+        self.body = p.createMultiBody(
+            baseMass=3.0, baseCollisionShapeIndex=body_collision, baseVisualShapeIndex=body_visual,
+            basePosition=start_pos, baseOrientation=p.getQuaternionFromEuler([0,0,start_yaw]),
+            linkMasses=[0.3,0.3], linkCollisionShapeIndices=[wheel_col,wheel_col],
+            linkVisualShapeIndices=[wheel_vis,wheel_vis], linkPositions=link_positions,
+            linkOrientations=link_orientations, linkInertialFramePositions=[[0,0,0],[0,0,0]],
+            linkInertialFrameOrientations=[p.getQuaternionFromEuler([0,0,0]),p.getQuaternionFromEuler([0,0,0])],
+            linkParentIndices=[0,0], linkJointTypes=[p.JOINT_REVOLUTE,p.JOINT_REVOLUTE],
+            linkJointAxis=[[0,1,0],[0,1,0]]
+        )
 
-    def percent_covered(self):
-        free_cells = np.sum(self.grid < 0.5)
-        total = self.size_cells * self.size_cells
-        return 100.0 * free_cells / total
+        self.left_wheel_idx=0
+        self.right_wheel_idx=1
+        p.setJointMotorControl2(self.body,self.left_wheel_idx,p.VELOCITY_CONTROL,targetVelocity=0,force=0)
+        p.setJointMotorControl2(self.body,self.right_wheel_idx,p.VELOCITY_CONTROL,targetVelocity=0,force=0)
 
-    def save(self, filename=MAP_FILE):
-        with open(filename, "wb") as f:
-            pickle.dump({
-                "grid": self.grid,
-                "visits": self.visits,
-                "cleaned_time": self.cleaned_time,
-                "world_size": self.world_size,
-                "resolution": self.resolution
-            }, f)
+        self.x, self.y, self.yaw = start_pos[0], start_pos[1], start_yaw
+        self.odom_x, self.odom_y, self.odom_yaw = self.x, self.y, self.yaw
+        self.encoder_noise_std = 0.005
+        self.odom_noise_trans = 0.001
+        self.odom_noise_rot = math.radians(0.3)
 
-    def load(self, filename=MAP_FILE):
-        with open(filename, "rb") as f:
-            data = pickle.load(f)
-        self.grid = data["grid"]
-        self.visits = data["visits"]
-        self.cleaned_time = data["cleaned_time"]
-        self.world_size = data["world_size"]
-        self.resolution = data["resolution"]
-        self.origin_offset = self.world_size / 2.0
-        self.size_cells = self.grid.shape[0]
+    def set_wheel_targets(self,left_rad_s,right_rad_s):
+        self.target_left = left_rad_s
+        self.target_right = right_rad_s
 
-    def unexplored_frontiers(self, threshold_visits=1):
-        # return list of world coordinates of low-visit cells adjacent to free cells
-        frontiers = []
-        for ix in range(1, self.size_cells - 1):
-            for iy in range(1, self.size_cells - 1):
-                if self.visits[ix, iy] <= threshold_visits and self.grid[ix, iy] < 0.5:
-                    # check neighbor with 0 visits indicates frontier
-                    neigh = self.visits[ix-1:ix+2, iy-1:iy+2]
-                    if np.any(neigh > threshold_visits):
-                        x, y = map_to_world(ix, iy, self.origin_offset, self.resolution)
-                        frontiers.append((x, y))
-        return frontiers
+    def apply_pid_and_torque(self, dt):
+        lj = p.getJointState(self.body,self.left_wheel_idx)
+        rj = p.getJointState(self.body,self.right_wheel_idx)
+        vel_left = lj[1] + np.random.normal(0,self.encoder_noise_std)
+        vel_right = rj[1] + np.random.normal(0,self.encoder_noise_std)
+        err_l = self.target_left - vel_left
+        err_r = self.target_right - vel_right
+        torque_l = max(min(self.left_pid.update(err_l, dt), MAX_WHEEL_TORQUE), -MAX_WHEEL_TORQUE)
+        torque_r = max(min(self.right_pid.update(err_r, dt), MAX_WHEEL_TORQUE), -MAX_WHEEL_TORQUE)
+        p.setJointMotorControl2(self.body,self.left_wheel_idx,p.TORQUE_CONTROL,force=torque_l)
+        p.setJointMotorControl2(self.body,self.right_wheel_idx,p.TORQUE_CONTROL,force=torque_r)
 
-# ---------- Robot (differential) ----------
-class DiffRobot:
-    def __init__(self, client, start_pos=(0, 0, 0.05), start_yaw=0.0):
-        self.client = client
-        self._create_body(start_pos, start_yaw)
-        self.max_speed = 4.0  # rad/s for wheels
-        self.wheel_radius = 0.05
-        self.wheel_base = 0.25  # distance between wheels
-        self.left_integral = 0.0
-        self.right_integral = 0.0
-        self.left_last_err = 0.0
-        self.right_last_err = 0.0
+    def update_internal_pose_from_sim(self):
+        base_pos,_ = p.getBasePositionAndOrientation(self.body)
+        self.x, self.y = base_pos[0], base_pos[1]
 
-    def _create_body(self, pos, yaw):
-        # Simple cylinder as base + two tiny boxes as wheels (visual only)
-        col = p.createCollisionShape(p.GEOM_CYLINDER, radius=ROBOT_RADIUS, height=0.06)
-        vis = p.createVisualShape(p.GEOM_CYLINDER, radius=ROBOT_RADIUS, length=0.06, rgbaColor=[0.2,0.2,0.8,1])
-        mass = 3.0
-        self.body = p.createMultiBody(mass, col, vis, basePosition=pos, baseOrientation=p.getQuaternionFromEuler([0,0,yaw]))
+    def update_odometry_from_encoders(self, dt):
+        lj = p.getJointState(self.body,self.left_wheel_idx)
+        rj = p.getJointState(self.body,self.right_wheel_idx)
+        wl = lj[1] + np.random.normal(0,self.encoder_noise_std)
+        wr = rj[1] + np.random.normal(0,self.encoder_noise_std)
+        dl = self.wheel_radius*wl*dt + np.random.normal(0,self.odom_noise_trans)
+        dr = self.wheel_radius*wr*dt + np.random.normal(0,self.odom_noise_trans)
+        dc = (dl+dr)/2
+        dyaw = (dr-dl)/self.wheel_base + np.random.normal(0,self.odom_noise_rot)
+        self.odom_x += dc*math.cos(self.odom_yaw)
+        self.odom_y += dc*math.sin(self.odom_yaw)
+        self.odom_yaw = wrap_to_pi(self.odom_yaw+dyaw)
 
-    def get_pose(self):
-        pos, orn = p.getBasePositionAndOrientation(self.body)
-        yaw = p.getEulerFromQuaternion(orn)[2]
-        vx, vy, vz = p.getBaseVelocity(self.body)[0]
-        linear_speed = math.hypot(vx, vy)
-        return (pos[0], pos[1], yaw, linear_speed)
+    def read_ultrasonic_sensors(self):
+        results=[]
+        base_pos, base_orn = p.getBasePositionAndOrientation(self.body)
+        bx,by,bz=base_pos
+        _,_,yaw=p.getEulerFromQuaternion(base_orn)
+        sz = bz+0.02
+        from_positions=[]
+        to_positions=[]
+        for ang in self.sensor_angles:
+            ang_world = yaw + ang
+            tx = bx + self.sensor_range*math.cos(ang_world)
+            ty = by + self.sensor_range*math.sin(ang_world)
+            tz = sz
+            from_positions.append([bx,by,sz])
+            to_positions.append([tx,ty,tz])
+        ray_results = p.rayTestBatch(from_positions,to_positions)
+        for rr in ray_results:
+            hit_fraction = rr[2]
+            dist = hit_fraction*self.sensor_range if hit_fraction<1.0 else float('inf')
+            results.append(dist)
+        return results
 
-    def set_wheel_speeds(self, left_cmd, right_cmd):
-        # very simple: apply velocity to base using differential kinematics
-        left = clamp(left_cmd, -self.max_speed, self.max_speed)
-        right = clamp(right_cmd, -self.max_speed, self.max_speed)
-        # convert to linear and angular velocities
-        v = self.wheel_radius * (left + right) / 2.0
-        omega = self.wheel_radius * (right - left) / self.wheel_base
-        # compute world frame velocity
-        x, y, yaw, _ = self.get_pose()
-        vx = v * math.cos(yaw)
-        vy = v * math.sin(yaw)
-        # set base velocity directly (simulating motor effect)
-        p.resetBaseVelocity(self.body, linearVelocity=[vx, vy, 0], angularVelocity=[0,0,omega])
+    def read_velocity(self):
+        lj = p.getJointState(self.body,self.left_wheel_idx)
+        rj = p.getJointState(self.body,self.right_wheel_idx)
+        wl,wr = lj[1], rj[1]
+        v_lin = self.wheel_radius*0.5*(wl+wr)
+        v_ang = self.wheel_radius*(wr-wl)/self.wheel_base
+        return v_lin,v_ang
 
-    def step_pid(self, left_target, right_target, dt):
-        # naive PID (only P for simplicity)
-        self.set_wheel_speeds(left_target, right_target)
+# -----------------------
+# Mapa de ocupação
+# -----------------------
+class CoverageMap:
+    def __init__(self, x_range=(-2,2), y_range=(-1.5,1.5), cell_size=0.05):
+        self.cell_size = cell_size
+        self.xmin, self.xmax = x_range
+        self.ymin, self.ymax = y_range
+        self.nx = int((self.xmax-self.xmin)/cell_size)
+        self.ny = int((self.ymax-self.ymin)/cell_size)
+        self.map = np.zeros((self.nx,self.ny), dtype=float)
 
-    def ray_sensors(self, angles=SENSOR_ANGLES, max_range=SENSOR_RANGE):
-        # cast rays from robot center at given angles relative to heading
-        pos, orn = p.getBasePositionAndOrientation(self.body)
-        x, y, _ = pos
-        yaw = p.getEulerFromQuaternion(orn)[2]
-        readings = []
-        for a in angles:
-            ang = yaw + a
-            from_pos = [x, y, 0.03]
-            to_pos = [x + max_range * math.cos(ang), y + max_range * math.sin(ang), 0.03]
-            res = p.rayTest(from_pos, to_pos)[0]
-            hit = res[0]
-            if hit == -1:
-                dist = max_range
-                hitpos = to_pos
-            else:
-                hitpos = res[3]
-                dx = hitpos[0] - x
-                dy = hitpos[1] - y
-                dist = math.hypot(dx, dy)
-            readings.append((dist, hitpos))
-        return readings
+    def pos_to_idx(self, x, y):
+        ix = int((x-self.xmin)/self.cell_size)
+        iy = int((y-self.ymin)/self.cell_size)
+        return ix, iy
 
-# ---------- Simple local controller (explore + avoid) ----------
+    def update(self, x, y, dt=1.0):
+        ix, iy = self.pos_to_idx(x, y)
+        if 0<=ix<self.nx and 0<=iy<self.ny:
+            self.map[ix, iy] += dt
+
+    def coverage_ratio(self):
+        return np.sum(self.map>0)/self.map.size
+
+    def get_least_visited_direction(self, x, y):
+        ix, iy = self.pos_to_idx(x, y)
+        neighborhood = self.map[max(0,ix-1):min(self.nx,ix+2), max(0,iy-1):min(self.ny,iy+2)]
+        min_idx = np.unravel_index(np.argmin(neighborhood), neighborhood.shape)
+        dx = (min_idx[0] + max(0,ix-1) - ix) * self.cell_size
+        dy = (min_idx[1] + max(0,iy-1) - iy) * self.cell_size
+        return dx, dy
+
+# -----------------------
+# Controle local
+# -----------------------
 class LocalController:
-    def __init__(self, robot: DiffRobot):
+    def __init__(self, robot: DifferentialRobot, coverage_map:CoverageMap=None):
         self.robot = robot
-        self.target_v = 0.3  # forward m/s
-        self.turn_v = 0.6
-        self.min_clearance = 0.35
+        self.cruise_speed = 0.2
+        self.sensor_threshold = 0.45
+        self.avoid_angular_speed = 1.0
+        self.max_wheel_rad = 20.0
+        self.coverage_map = coverage_map
 
-    def decide(self, sensor_readings):
-        # sensor_readings: list of (dist, hitpos)
-        left_d, _, = sensor_readings[0]
-        front_d, _ = sensor_readings[1]
-        right_d, _ = sensor_readings[2]
-
-        # Simple behavior: if front too close -> rotate away from closer obstacle
-        if front_d < self.min_clearance:
-            # rotate in direction of largest space
-            if left_d > right_d:
-                # turn left
-                left_w = -0.6
-                right_w = 0.6
+    def compute_wheel_targets(self):
+        dists = self.robot.read_ultrasonic_sensors()
+        close_idxs = [i for i,d in enumerate(dists) if d<self.sensor_threshold]
+        if close_idxs:
+            min_idx = int(np.argmin(np.array(dists)))
+            angle = self.robot.sensor_angles[min_idx]
+            if angle<0:
+                vl = self.avoid_angular_speed*(self.robot.wheel_base/2.0)
+                vr = -vl
             else:
-                left_w = 0.6
-                right_w = -0.6
-            return left_w, right_w
-
-        # if left or right very close, steer away a bit
-        if left_d < self.min_clearance:
-            return 0.2, 0.6  # slight right
-        if right_d < self.min_clearance:
-            return 0.6, 0.2  # slight left
-
-        # otherwise go forward
-        # map forward speed to wheel velocities
-        # v = r*(L+R)/2 => choose L and R equal
-        desired_v = self.target_v  # m/s
-        wheel_r = self.robot.wheel_radius
-        desired_wheel = desired_v / wheel_r
-        return desired_wheel, desired_wheel
-
-# ---------- Simple Node-RED logger (HTTP) ----------
-class NodeRedLogger:
-    def __init__(self, url=None):
-        self.url = url
-        if url and requests is None:
-            print("requests não instalado — desabilitando envio HTTP.")
-            self.url = None
-
-    def send(self, payload):
-        if not self.url:
-            return
-        try:
-            headers = {"Content-Type": "application/json"}
-            requests.post(self.url, json=payload, headers=headers, timeout=1.0)
-        except Exception as e:
-            # fail silently for now
-            print("Falha ao enviar para Node-RED:", e)
-
-# ---------- World builder ----------
-def build_world(client):
-    p.setGravity(0, 0, -9.81, physicsClientId=client)
-    p.resetSimulation(physicsClientId=client)
-    p.setAdditionalSearchPath(pybullet_data.getDataPath(), physicsClientId=client)
-    plane = p.loadURDF("plane.urdf", physicsClientId=client)
-    # create walls / rooms (simple boxes) - a "house" like layout
-    walls = []
-    wall_height = 0.2
-    # outer walls (a square)
-    thickness = 0.05
-    size = WORLD_SIZE / 2.0
-    # four walls as thin boxes placed around
-    wall_shapes = []
-    def mk_wall(cx, cy, lx, ly):
-        col = p.createCollisionShape(p.GEOM_BOX, halfExtents=[lx/2, ly/2, wall_height/2])
-        vis = p.createVisualShape(p.GEOM_BOX, halfExtents=[lx/2, ly/2, wall_height/2], rgbaColor=[0.8,0.8,0.8,1])
-        body = p.createMultiBody(0, col, vis, basePosition=[cx, cy, wall_height/2])
-        return body
-
-    # perimeter
-    mk_wall(0, size + thickness/2, WORLD_SIZE, thickness)
-    mk_wall(0, -size - thickness/2, WORLD_SIZE, thickness)
-    mk_wall(size + thickness/2, 0, thickness, WORLD_SIZE)
-    mk_wall(-size - thickness/2, 0, thickness, WORLD_SIZE)
-
-    # interior obstacles: create some boxes representing furniture / walls
-    mk_wall(1.2, 0.8, 1.6, 0.06)  # corridor wall
-    mk_wall(-1.2, -0.8, 1.0, 0.06)
-    mk_wall(0.0, -1.5, 0.06, 1.0)
-    # larger block (table)
-    table_col = p.createCollisionShape(p.GEOM_BOX, halfExtents=[0.4, 0.6, 0.05])
-    table_vis = p.createVisualShape(p.GEOM_BOX, halfExtents=[0.4, 0.6, 0.05], rgbaColor=[0.6,0.3,0.1,1])
-    p.createMultiBody(0, table_col, table_vis, basePosition=[-0.8, 1.2, 0.05])
-    return plane
-
-# ---------- Simulation Runner ----------
-class Simulator:
-    def __init__(self, node_red_url=None, gui=True):
-        if gui:
-            self.client = p.connect(p.GUI)
+                vl = -self.avoid_angular_speed*(self.robot.wheel_base/2.0)
+                vr = vl
         else:
-            self.client = p.connect(p.DIRECT)
-        p.setPhysicsEngineParameter(fixedTimeStep=TIME_STEP, physicsClientId=self.client)
-        build_world(self.client)
-        self.robot = DiffRobot(self.client)
-        self.controller = LocalController(self.robot)
-        self.map = OccupancyGrid()
-        self.logger = NodeRedLogger(node_red_url)
-        self.metrics = {
-            "trajectory": [],
-            "time": 0.0,
-            "collisions": 0,
-            "energy": 0.0,
-            "area_covered": 0.0
-        }
-        # for collision detection
-        self.prev_pos = None
+            if self.coverage_map:
+                dx, dy = self.coverage_map.get_least_visited_direction(self.robot.x, self.robot.y)
+                target_angle = math.atan2(dy, dx)
+                angle_diff = wrap_to_pi(target_angle - self.robot.yaw)
+                vl = self.cruise_speed - angle_diff
+                vr = self.cruise_speed + angle_diff
+            else:
+                vl = vr = self.cruise_speed
 
-    def update_map_from_sensors(self, sensor_readings, pose):
-        x, y, yaw, speed = pose
-        # mark free along rays, mark hit positions as occupied
-        for dist, hitpos in sensor_readings:
-            # mark free along ray sample points
-            steps = int(max(1, (dist / self.map.resolution)))
-            for s in range(1, steps+1):
-                sx = x + (s * (hitpos[0] - x) / (steps+0.0001))
-                sy = y + (s * (hitpos[1] - y) / (steps+0.0001))
-                self.map.mark_free(sx, sy)
-            # if hit within range and close, mark occupied
-            if dist < SENSOR_RANGE - 0.001:
-                self.map.mark_occupied(hitpos[0], hitpos[1], prob=1.0)
+        left_rad = max(min(vl/self.robot.wheel_radius,self.max_wheel_rad),-self.max_wheel_rad)
+        right_rad = max(min(vr/self.robot.wheel_radius,self.max_wheel_rad),-self.max_wheel_rad)
+        self.robot.set_wheel_targets(left_rad, right_rad)
 
-    def run_episode(self, max_time=120.0, start=(0,0,0.05), use_map_for_planning=False):
-        # reposition robot to start
-        p.resetBasePositionAndOrientation(self.robot.body, start, p.getQuaternionFromEuler([0,0,0]))
-        self.metrics = {"trajectory": [], "time": 0.0, "collisions": 0, "energy": 0.0, "area_covered": 0.0}
-        t = 0.0
-        last_time = time.time()
-        # For simple learning: bias to frontiers if map available
-        visited_positions = set()
-        while t < max_time:
-            # read sensors
-            sensors = self.robot.ray_sensors()
-            pose = self.robot.get_pose()
-            x, y, yaw, lin_spd = pose
+# -----------------------
+# Ambiente
+# -----------------------
+def build_environment():
+    p.setAdditionalSearchPath(pybullet_data.getDataPath())
+    p.loadURDF("plane.urdf")
+    wall_h=0.4
+    wt=0.05
+    def add_wall(center,half_extents):
+        col = p.createCollisionShape(p.GEOM_BOX,halfExtents=half_extents)
+        vis = p.createVisualShape(p.GEOM_BOX,halfExtents=half_extents,rgbaColor=[0.8,0.8,0.8,1])
+        return p.createMultiBody(baseMass=0,baseCollisionShapeIndex=col,baseVisualShapeIndex=vis,basePosition=center)
+    add_wall([0.0,1.5,wall_h/2],[2.0,wt,wall_h/2])
+    add_wall([0.0,-1.5,wall_h/2],[2.0,wt,wall_h/2])
+    add_wall([1.75,0.0,wall_h/2],[wt,1.5,wall_h/2])
+    add_wall([-1.75,0.0,wall_h/2],[wt,1.5,wall_h/2])
+    add_wall([0.5,0.5,0.2],[0.3,0.3,0.2])
+    add_wall([-0.7,-0.3,0.15],[0.15,0.15,0.15])
+    add_wall([-0.2,0.9,0.2],[0.2,0.4,0.2])
 
-            # detect collisions (rough): if base touches something (contacts)
-            contacts = p.getContactPoints(bodyA=self.robot.body)
-            if len(contacts) > 0:
-                self.metrics["collisions"] += 1
+# -----------------------
+# Loop principal
+# -----------------------
+def run_simulation_node_red(executions=3):
+    physicsClient = p.connect(p.GUI)
+    p.setGravity(0,0,-9.81)
+    p.setTimeStep(SIM_TIMESTEP)
+    p.setRealTimeSimulation(0)
 
-            # update map & visits
-            self.update_map_from_sensors(sensors, pose)
-            self.map.increment_visit(x, y, dt=TIME_STEP)
-            self.metrics["trajectory"].append((t, x, y, yaw))
-            visited_positions.add((round(x,2), round(y,2)))
+    build_environment()
+    coverage_map = CoverageMap()
 
-            # controller decision (if using learned map, try to head to nearest frontier sometimes)
-            left_cmd, right_cmd = self.controller.decide(sensors)
-            if use_map_for_planning and (int(t) % 6 == 0):
-                # occasionally pick a nearest frontier and drive toward it (very naive)
-                frontiers = self.map.unexplored_frontiers(threshold_visits=0)
-                if frontiers:
-                    # choose nearest frontier biasing by visits (prefer low visit)
-                    fx, fy = min(frontiers, key=lambda f: (f[0]-x)**2 + (f[1]-y)**2)
-                    # compute angle to frontier
-                    ang_to = math.atan2(fy - y, fx - x)
-                    ang_err = (ang_to - yaw + math.pi) % (2*math.pi) - math.pi
-                    # turn proportional
-                    if abs(ang_err) > 0.2:
-                        # rotate toward target
-                        if ang_err > 0:
-                            left_cmd, right_cmd = -0.6, 0.6
-                        else:
-                            left_cmd, right_cmd = 0.6, -0.6
-                    else:
-                        # go forward
-                        wheel = (self.controller.target_v / self.robot.wheel_radius)
-                        left_cmd, right_cmd = wheel, wheel
+    # MQTT
+    mqtt_client = mqtt.Client()
+    mqtt_client.connect("localhost", 1883, 60)
 
-            # apply to robot and step sim
-            self.robot.step_pid(left_cmd, right_cmd, TIME_STEP)
-            # energy estimate: sum of abs wheel torques ~ abs(wheel velocity) * dt (proxy)
-            self.metrics["energy"] += (abs(left_cmd) + abs(right_cmd)) * TIME_STEP
+    for run_idx in range(executions):
+        print(f"Execução {run_idx+1}/{executions}")
+        robot = DifferentialRobot(physicsClient, start_pos=(-1.0,-0.6,ROBOT_HALF_Z), start_yaw=math.radians(30))
+        controller = LocalController(robot, coverage_map if run_idx>0 else None)
 
+        sim_time=0.0
+        while sim_time<SIM_DURATION:
+            t0=time.time()
+            controller.compute_wheel_targets()
+            robot.apply_pid_and_torque(SIM_TIMESTEP)
             p.stepSimulation()
-            time.sleep(TIME_STEP if p.getConnectionInfo(self.client)['connectionMethod'] == 1 else 0)  # sleep only in GUI mode
-            t += TIME_STEP
+            robot.update_internal_pose_from_sim()
+            robot.update_odometry_from_encoders(SIM_TIMESTEP)
+            coverage_map.update(robot.x, robot.y, dt=SIM_TIMESTEP)
 
-        self.metrics["time"] = t
-        # coverage metric: percent of map cells visited at least once
-        self.metrics["area_covered"] = self.map.percent_covered()
-        self.metrics["unique_positions"] = len(visited_positions)
-        return self.metrics
+            # Envio MQTT
+            msg = {
+                "time": sim_time,
+                "x": robot.x,
+                "y": robot.y,
+                "yaw": robot.yaw,
+                "odom_x": robot.odom_x,
+                "odom_y": robot.odom_y,
+                "odom_yaw": robot.odom_yaw,
+                "v_lin": robot.read_velocity()[0],
+                "v_ang": robot.read_velocity()[1],
+                "coverage_ratio": coverage_map.coverage_ratio(),
+                "cell_time": coverage_map.map.tolist()
+            }
+            mqtt_client.publish("robot/simulation", json.dumps(msg))
 
-# ---------- Main / experiment loop ----------
-def main(args):
-    # prepare simulator
-    sim = Simulator(node_red_url=(None if args.no_node_red else args.node_red), gui=args.gui)
-    # optionally load previous map
-    learned = False
-    if args.load_map and os.path.exists(MAP_FILE):
-        sim.map.load(MAP_FILE)
-        print("Mapa carregado de", MAP_FILE)
-        learned = True
+            sim_time+=SIM_TIMESTEP
+            if SIM_REALTIME:
+                elapsed=time.time()-t0
+                time.sleep(max(0.0,SIM_TIMESTEP-elapsed))
 
-    run_results = []
-    for r in range(args.runs):
-        print(f"\n=== Execução {r+1}/{args.runs} (learned_map={learned}) ===")
-        start = (0.0, 0.0, 0.05)
-        metrics = sim.run_episode(max_time=args.episode_time, start=start, use_map_for_planning=learned)
-        print(f"Tempo: {metrics['time']:.1f}s | Cobertura: {metrics['area_covered']:.2f}% | Energia: {metrics['energy']:.2f} | Colisões: {metrics['collisions']}")
-        # send to Node-RED
-        payload = {
-            "run": r+1,
-            "time": metrics["time"],
-            "area_covered": metrics["area_covered"],
-            "energy": metrics["energy"],
-            "collisions": metrics["collisions"],
-            "unique_positions": metrics["unique_positions"],
-            "timestamp": time.time()
-        }
-        sim.logger.send(payload)
-        run_results.append(payload)
-        # after first run, mark that there is a learned map to use next time
-        sim.map.save(MAP_FILE)
-        learned = True
+        print(f"Cobertura após execução {run_idx+1}: {coverage_map.coverage_ratio()*100:.2f}%")
 
-        # quick break between runs
-        time.sleep(0.2)
-
-    # Save run results summary
-    summary_file = os.path.join(LOG_DIR, f"summary_{int(time.time())}.json")
-    with open(summary_file, "w") as f:
-        json.dump({"runs": run_results}, f, indent=2)
-    print("Resumo salvo em", summary_file)
-    print("Mapa salvo em", MAP_FILE)
-    # keep GUI open if requested
-    if args.gui:
-        print("Pressione Ctrl+C na janela do terminal para encerrar (PyBullet GUI).")
-        try:
-            while True:
-                time.sleep(1)
-        except KeyboardInterrupt:
-            pass
     p.disconnect()
+    mqtt_client.disconnect()
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Simulador Robô Aspirador - único arquivo")
-    parser.add_argument("--runs", type=int, default=3, help="Número de execuções (episódios)")
-    parser.add_argument("--episode-time", type=float, default=60.0, help="Tempo máximo por episódio (s)")
-    parser.add_argument("--load-map", action="store_true", help="Carregar mapa existente no início (se existir)")
-    parser.add_argument("--node-red", type=str, default="http://localhost:1880/log", help="URL do Node-RED para envio de logs (POST JSON)")
-    parser.add_argument("--no-node-red", action="store_true", help="Desabilitar envio para Node-RED")
-    parser.add_argument("--gui", action="store_true", default=True,
-                        help="Abrir GUI do PyBullet (padrão: sim). Use --gui False para modo headless.")
-
-    args = parser.parse_args()
-    main(args)
+if __name__=="__main__":
+    run_simulation_node_red()
