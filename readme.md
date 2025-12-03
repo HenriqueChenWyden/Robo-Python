@@ -54,15 +54,15 @@ contínua de dados para supervisório.
 
 ## 📂 Estrutura do Projeto
 
-differential_robot_sim/
-│
-├── main.py
-├── robot.py
-├── controller.py
-├── coverage_map.py
-├── environment.py
-├── requirements.txt
-└── assets/
+    differential_robot_sim/
+    │
+    ├── main.py
+    ├── robot.py
+    ├── controller.py
+    ├── coverage_map.py
+    ├── environment.py
+    ├── requirements.txt
+    └── assets/
 
 
 ------------------------------------------------------------------------
