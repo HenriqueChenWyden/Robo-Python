@@ -9,8 +9,8 @@ import paho.mqtt.client as mqtt
 # -----------------------
 # Parâmetros da simulação
 # -----------------------
-SIM_TIMESTEP = 1.0 / 100.0
-SIM_REALTIME = False
+SIM_TIMESTEP = 1.0 / 70.0
+SIM_REALTIME = True
 SIM_DURATION = 500.0  # segundos
 
 # Robô / roda
@@ -23,7 +23,7 @@ ROBOT_RADIUS = 0.15
 ROBOT_HEIGHT = 0.10
 MAX_WHEEL_TORQUE = 10.0  # N*m
 # Sujeira (pontos que o robô deve passar por cima)
-NUM_DIRT = 100
+NUM_DIRT = 50
 DIRT_RADIUS = 0.02
 
 # Sensores ultrassom (ângulos relativos ao heading do robô)
@@ -122,22 +122,10 @@ class DifferentialRobot:
         self.target_right = right_rad_s
 
     def apply_pid_and_torque(self, dt):
-        # leituras de juntas protegidas contra falhas
-        try:
-            num_j = p.getNumJoints(self.body)
-        except Exception:
-            num_j = 0
-        def _joint_vel(idx):
-            if idx is None or idx<0 or idx>=num_j:
-                return 0.0
-            try:
-                js = p.getJointState(self.body, idx)
-                return js[1]
-            except Exception:
-                return 0.0
-
-        vel_left = _joint_vel(self.left_wheel_idx) + np.random.normal(0,self.encoder_noise_std)
-        vel_right = _joint_vel(self.right_wheel_idx) + np.random.normal(0,self.encoder_noise_std)
+        lj = p.getJointState(self.body,self.left_wheel_idx)
+        rj = p.getJointState(self.body,self.right_wheel_idx)
+        vel_left = lj[1] + np.random.normal(0,self.encoder_noise_std)
+        vel_right = rj[1] + np.random.normal(0,self.encoder_noise_std)
         err_l = self.target_left - vel_left
         err_r = self.target_right - vel_right
         torque_l = max(min(self.left_pid.update(err_l, dt), MAX_WHEEL_TORQUE), -MAX_WHEEL_TORQUE)
@@ -148,29 +136,15 @@ class DifferentialRobot:
     def update_internal_pose_from_sim(self):
         base_pos, base_orn = p.getBasePositionAndOrientation(self.body)
         self.x, self.y = base_pos[0], base_pos[1]
-        # atualizar também o yaw real a partir da simulação
-        try:
-            eul = p.getEulerFromQuaternion(base_orn)
-            self.yaw = eul[2]
-        except Exception:
-            pass
+        # atualizar também o yaw real a partir da simulação (evita comportamento incorreto do controlador)
+        eul = p.getEulerFromQuaternion(base_orn)
+        self.yaw = eul[2]
 
     def update_odometry_from_encoders(self, dt):
-        try:
-            num_j = p.getNumJoints(self.body)
-        except Exception:
-            num_j = 0
-        def _joint_vel(idx):
-            if idx is None or idx<0 or idx>=num_j:
-                return 0.0
-            try:
-                js = p.getJointState(self.body, idx)
-                return js[1]
-            except Exception:
-                return 0.0
-
-        wl = _joint_vel(self.left_wheel_idx) + np.random.normal(0,self.encoder_noise_std)
-        wr = _joint_vel(self.right_wheel_idx) + np.random.normal(0,self.encoder_noise_std)
+        lj = p.getJointState(self.body,self.left_wheel_idx)
+        rj = p.getJointState(self.body,self.right_wheel_idx)
+        wl = lj[1] + np.random.normal(0,self.encoder_noise_std)
+        wr = rj[1] + np.random.normal(0,self.encoder_noise_std)
         dl = self.wheel_radius*wl*dt + np.random.normal(0,self.odom_noise_trans)
         dr = self.wheel_radius*wr*dt + np.random.normal(0,self.odom_noise_trans)
         dc = (dl+dr)/2
@@ -197,26 +171,14 @@ class DifferentialRobot:
         ray_results = p.rayTestBatch(from_positions,to_positions)
         for rr in ray_results:
             hit_fraction = rr[2]
-            # hit_fraction == 1.0 significa sem interseção; considerar <1.0 como hit
-            dist = hit_fraction*self.sensor_range if hit_fraction < 1.0 else float('inf')
+            dist = hit_fraction*self.sensor_range if hit_fraction<3.0 else float('inf')
             results.append(dist)
         return results
 
     def read_velocity(self):
-        try:
-            num_j = p.getNumJoints(self.body)
-        except Exception:
-            num_j = 0
-        def _joint_vel(idx):
-            if idx is None or idx<0 or idx>=num_j:
-                return 0.0
-            try:
-                js = p.getJointState(self.body, idx)
-                return js[1]
-            except Exception:
-                return 0.0
-
-        wl,wr = _joint_vel(self.left_wheel_idx), _joint_vel(self.right_wheel_idx)
+        lj = p.getJointState(self.body,self.left_wheel_idx)
+        rj = p.getJointState(self.body,self.right_wheel_idx)
+        wl,wr = lj[1], rj[1]
         v_lin = self.wheel_radius*0.5*(wl+wr)
         v_ang = self.wheel_radius*(wr-wl)/self.wheel_base
         return v_lin,v_ang
@@ -265,30 +227,44 @@ class LocalController:
         self.avoid_angular_speed = 1.0
         self.max_wheel_rad = 20.0
         self.coverage_map = coverage_map
-        # alvo atual de sujeira (x,y)
+        # ponto alvo (x,y) de sujeira a ser limpo; None quando sem alvo
         self.target_point = None
 
     def compute_wheel_targets(self):
         dists = self.robot.read_ultrasonic_sensors()
-        close_idxs = [i for i,d in enumerate(dists) if d<self.sensor_threshold]
-        if close_idxs:
-            min_idx = int(np.argmin(np.array(dists)))
+        # comportamento: se detectar obstáculo, recuar ou desviar; caso contrário, seguir cobertura/cruise
+        min_idx = int(np.argmin(np.array(dists)))
+        min_dist = dists[min_idx]
+        back_speed = 0.12
+        # se qualquer sensor abaixo do limiar
+        if min_dist < self.sensor_threshold:
             angle = self.robot.sensor_angles[min_idx]
-            if angle<0:
-                vl = self.avoid_angular_speed*(self.robot.wheel_base/2.0)
-                vr = -vl
+            # sensor central muito próximo -> recuar reto
+            if min_idx == 2:
+                vl = vr = -back_speed
             else:
-                vl = -self.avoid_angular_speed*(self.robot.wheel_base/2.0)
-                vr = vl
+                # obstáculo lateral: desviar na direção oposta enquanto recua levemente
+                if angle > 0:  # obstáculo à esquerda -> virar para a direita
+                    vl = -back_speed * 0.6
+                    vr = back_speed * 0.6
+                else:  # obstáculo à direita -> virar para a esquerda
+                    vl = back_speed * 0.6
+                    vr = -back_speed * 0.6
+                # se estiver muito perto, recuar mais antes de girar
+                if min_dist < 0.25:
+                    vl -= back_speed * 0.5
+                    vr -= back_speed * 0.5
         else:
-            # se houver um alvo de sujeira, navegar até ele
+            # se há um ponto alvo de sujeira, navegue até ele
             if self.target_point is not None:
                 tx, ty = self.target_point
                 dx = tx - self.robot.x
                 dy = ty - self.robot.y
                 target_angle = math.atan2(dy, dx)
                 angle_diff = wrap_to_pi(target_angle - self.robot.yaw)
+                # reduzir velocidade frontal quando precisa girar muito
                 forward = max(0.05, self.cruise_speed * (1.0 - min(abs(angle_diff)/math.pi, 0.9)))
+                # converter forward+angle_diff para velocidades de roda simples
                 vl = forward - 0.5 * angle_diff
                 vr = forward + 0.5 * angle_diff
             else:
@@ -313,14 +289,10 @@ def build_environment():
     p.loadURDF("plane.urdf")
     wall_h=0.4
     wt=0.05
-    walls = []
     def add_wall(center,half_extents):
         col = p.createCollisionShape(p.GEOM_BOX,halfExtents=half_extents)
         vis = p.createVisualShape(p.GEOM_BOX,halfExtents=half_extents,rgbaColor=[0.8,0.8,0.8,1])
-        wid = p.createMultiBody(baseMass=0,baseCollisionShapeIndex=col,baseVisualShapeIndex=vis,basePosition=center)
-        # registrar parede (centro, half_extents) para evitar spawn de sujeira dentro dela
-        walls.append((center, half_extents))
-        return wid
+        return p.createMultiBody(baseMass=0,baseCollisionShapeIndex=col,baseVisualShapeIndex=vis,basePosition=center)
     add_wall([0.0,1.5,wall_h/2],[2.0,wt,wall_h/2])
     add_wall([0.0,-1.5,wall_h/2],[2.0,wt,wall_h/2])
     add_wall([1.75,0.0,wall_h/2],[wt,1.5,wall_h/2])
@@ -329,46 +301,18 @@ def build_environment():
     add_wall([-0.7,-0.3,0.15],[0.15,0.15,0.15])
     add_wall([-0.2,0.9,0.2],[0.2,0.4,0.2])
 
-    # criar pontos de "sujeira" espalhados aleatoriamente dentro da área útil (apenas visual, sem colisão)
+    # criar pontos de "sujeira" espalhados aleatoriamente dentro da área útil
     dirt_bodies = []
-    robot_start = (-1.0, -0.6)
-    margin = 0.05
     for i in range(NUM_DIRT):
-        placed = False
-        attempts = 0
-        while not placed and attempts < 200:
-            attempts += 1
-            x = float(np.random.uniform(-1.4, 1.4))
-            y = float(np.random.uniform(-1.2, 1.2))
-            # evitar spawn muito próximo ao ponto inicial do robô
-            if math.hypot(x-robot_start[0], y-robot_start[1]) < (ROBOT_RADIUS + 0.25):
-                continue
-            # verificar se está dentro de alguma parede/obstáculo
-            bad = False
-            for (c, he) in walls:
-                cx, cy, cz = c
-                hx, hy, hz = he
-                if abs(x-cx) < (hx + margin) and abs(y-cy) < (hy + margin):
-                    bad = True
-                    break
-            if bad:
-                continue
-            # evitar colisão com outras sujeiras (mínima separação)
-            ok = True
-            for other in dirt_bodies:
-                opos, _ = p.getBasePositionAndOrientation(other)
-                if math.hypot(x-opos[0], y-opos[1]) < (DIRT_RADIUS*2.5):
-                    ok = False
-                    break
-            if not ok:
-                continue
-            # criar visual da sujeira
-            z = DIRT_RADIUS
-            dirt_vis = p.createVisualShape(p.GEOM_SPHERE, radius=DIRT_RADIUS, rgbaColor=[0.45,0.3,0.15,1.0])
-            dirt_id = p.createMultiBody(baseMass=0, baseCollisionShapeIndex=-1, baseVisualShapeIndex=dirt_vis, basePosition=[x,y,z])
-            dirt_bodies.append(dirt_id)
-            placed = True
-        # se não conseguiu posicionar após tentativas, pula
+        # evitar gerar muito próximo das paredes: usar margem
+        x = float(np.random.uniform(-1.4, 1.4))
+        y = float(np.random.uniform(-1.2, 1.2))
+        z = DIRT_RADIUS
+        dirt_col = p.createCollisionShape(p.GEOM_SPHERE, radius=DIRT_RADIUS)
+        dirt_vis = p.createVisualShape(p.GEOM_SPHERE, radius=DIRT_RADIUS, rgbaColor=[0.45,0.3,0.15,1.0])
+        dirt_id = p.createMultiBody(baseMass=0, baseCollisionShapeIndex=dirt_col, baseVisualShapeIndex=dirt_vis, basePosition=[x,y,z])
+        dirt_bodies.append(dirt_id)
+
     return dirt_bodies
 
 # -----------------------
@@ -396,8 +340,9 @@ def run_simulation_node_red(executions=3):
         remaining_dirt = set(dirt_bodies)
         while sim_time<SIM_DURATION:
             t0=time.time()
-            # selecionar sujeira mais próxima como target
+            # atualizar alvo de sujeira mais próximo (se houver)
             if remaining_dirt:
+                # encontrar a sujeira mais próxima ao robô
                 best = None
                 best_d = float('inf')
                 for d in list(remaining_dirt):
@@ -429,11 +374,12 @@ def run_simulation_node_red(executions=3):
                 try:
                     dpos, _ = p.getBasePositionAndOrientation(d)
                 except Exception:
+                    # se já removido ou inválido, ignorar
                     remaining_dirt.discard(d)
                     continue
                 dist = math.hypot(dpos[0]-robot.x, dpos[1]-robot.y)
+                # considerar o raio do robô e da partícula ao detectar passagem por cima
                 if dist <= (ROBOT_RADIUS * 0.95 + DIRT_RADIUS):
-                    # remover visualmente o ponto (sem colisão existirão apenas visuais)
                     p.removeBody(d)
                     remaining_dirt.discard(d)
 
