@@ -9,9 +9,9 @@ import paho.mqtt.client as mqtt
 # -----------------------
 # Parâmetros da simulação
 # -----------------------
-SIM_TIMESTEP = 1.0 / 100.0
-SIM_REALTIME = False
-SIM_DURATION = 500.0  # segundos
+SIM_TIMESTEP = 1.0 / 200.0
+SIM_REALTIME = True
+SIM_DURATION = 3000.0  # segundos
 
 # Robô / roda
 WHEEL_RADIUS = 0.04  # m
@@ -23,7 +23,7 @@ ROBOT_RADIUS = 0.15
 ROBOT_HEIGHT = 0.10
 MAX_WHEEL_TORQUE = 10.0  # N*m
 # Sujeira (pontos que o robô deve passar por cima)
-NUM_DIRT = 100
+NUM_DIRT = 75
 DIRT_RADIUS = 0.02
 
 # Sensores ultrassom (ângulos relativos ao heading do robô)
